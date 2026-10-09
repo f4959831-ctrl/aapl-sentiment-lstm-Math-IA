@@ -1,0 +1,564 @@
+import sys
+import subprocess
+import random
+from datetime import datetime
+
+
+def install_package(import_name, pip_name=None):
+    pip_name = pip_name or import_name
+    try:
+        __import__(import_name)
+        return
+    except ImportError:
+        pass
+
+    print(f"Installing missing package: {pip_name}")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+    except subprocess.CalledProcessError:
+        print("Standard install failed, retrying with --break-system-packages ...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--break-system-packages", pip_name]
+        )
+
+
+install_package("pandas")
+install_package("numpy")
+install_package("yfinance")
+install_package("sklearn", "scikit-learn")
+install_package("torch")
+install_package("requests")
+
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import requests
+
+from sklearn.preprocessing import MinMaxScaler
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+
+TICKER = "AAPL"
+TRAIN_START = "2024-01-01"
+TRAIN_END = "2025-01-01"
+SEQUENCE_LENGTH = 20
+DAYS_TO_PREDICT = 30
+EPOCHS = 50
+BATCH_SIZE = 16
+VALIDATION_SPLIT = 0.1
+SENTIMENT_DECAY = 0.9  # how fast future sentiment fades toward neutral
+VOLATILITY_SCALE = 0.3  # how much historical-volatility jitter to layer onto the forecast
+                         # (1.0 = full historical volatility, 0.0 = perfectly smooth model curve)
+                         # (1.0 = full historical volatility, 0.0 = perfectly smooth model curve)
+SEED = 42  # fixed seed everywhere below -> identical results on every run
+
+# Get a free key at https://www.alphavantage.co/support/#api-key
+ALPHA_VANTAGE_API_KEY = ""  # <-- paste your key here
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+# ============================================================
+# HELPER: robustly clean a yfinance download into (Date, <col>)
+# ============================================================
+
+def clean_yf_download(df, output_col_name):
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    if "Close" in df.columns:
+        price_col = "Close"
+    elif "Adj Close" in df.columns:
+        price_col = "Adj Close"
+    else:
+        print("ERROR: could not find a Close/Adj Close column.")
+        print("Available columns:", list(df.columns))
+        return None
+
+    df = df[[price_col]].rename(columns={price_col: output_col_name})
+    df = df.reset_index()
+
+    if "Date" not in df.columns:
+        df.rename(columns={df.columns[0]: "Date"}, inplace=True)
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    if getattr(df["Date"].dt, "tz", None) is not None:
+        df["Date"] = df["Date"].dt.tz_localize(None)
+
+    df["Date"] = df["Date"].dt.normalize()
+    df[output_col_name] = pd.to_numeric(df[output_col_name], errors="coerce")
+
+    df.dropna(subset=["Date", output_col_name], inplace=True)
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    return df
+
+
+# ============================================================
+# HELPER: fetch real daily news sentiment from Alpha Vantage
+# ============================================================
+
+def fetch_daily_sentiment(ticker, api_key, start_dt, end_dt, limit=1000):
+    """
+    Returns a DataFrame with columns [Date, RealSentiment] (one row per
+    day that had news coverage, averaged across that day's articles),
+    or None if no key is set / the request fails / nothing is returned.
+    """
+
+    if not api_key:
+        print("No Alpha Vantage API key set -- skipping real sentiment.")
+        return None
+
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "tickers": ticker,
+        "time_from": start_dt.strftime("%Y%m%dT%H%M"),
+        "time_to": end_dt.strftime("%Y%m%dT%H%M"),
+        "limit": limit,
+        "apikey": api_key,
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        data = resp.json()
+    except Exception as e:
+        print("WARNING: Alpha Vantage request failed:", e)
+        return None
+
+    if "feed" not in data:
+        # Common failure modes: rate limit hit, bad/missing key, etc.
+        # Alpha Vantage reports these via "Note"/"Information"/"Error Message".
+        reason = data.get("Note") or data.get("Information") or data.get("Error Message") or data
+        print("WARNING: Alpha Vantage did not return news data.")
+        print("Details:", reason)
+        return None
+
+    daily_scores = {}
+    for item in data["feed"]:
+        try:
+            pub_date = datetime.strptime(item["time_published"][:8], "%Y%m%d").date()
+        except (KeyError, ValueError):
+            continue
+
+        # Prefer the ticker-specific sentiment score for AAPL if this
+        # article tags it; otherwise fall back to the overall score.
+        score = None
+        for ts in item.get("ticker_sentiment", []):
+            if ts.get("ticker") == ticker:
+                try:
+                    score = float(ts["ticker_sentiment_score"])
+                except (KeyError, ValueError, TypeError):
+                    pass
+                break
+
+        if score is None:
+            try:
+                score = float(item.get("overall_sentiment_score"))
+            except (TypeError, ValueError):
+                continue
+
+        daily_scores.setdefault(pub_date, []).append(score)
+
+    if not daily_scores:
+        print("WARNING: Alpha Vantage returned no usable AAPL sentiment scores.")
+        return None
+
+    sentiment_df = pd.DataFrame(
+        [{"Date": pd.Timestamp(d), "RealSentiment": float(np.mean(scores))}
+         for d, scores in daily_scores.items()]
+    )
+    sentiment_df.sort_values("Date", inplace=True)
+    sentiment_df.reset_index(drop=True, inplace=True)
+
+    print(f"Fetched real sentiment for {len(sentiment_df)} distinct days "
+          f"({sum(len(v) for v in daily_scores.values())} articles total).")
+
+    return sentiment_df
+
+
+# ============================================================
+# 1. DOWNLOAD APPLE HISTORICAL DATA
+# ============================================================
+
+print("=" * 60)
+print(f"Downloading {TICKER} historical data...")
+print("=" * 60)
+
+try:
+    raw_download = yf.download(
+        TICKER,
+        start=TRAIN_START,
+        end=TRAIN_END,
+        auto_adjust=False,
+        progress=False,
+    )
+except Exception as e:
+    print("\nERROR: Could not download historical data.")
+    print("Details:", e)
+    sys.exit()
+
+if raw_download.empty:
+    print("\nERROR: No historical data was downloaded.")
+    print("Check your internet connection and try again.")
+    sys.exit()
+
+print("\nDownloaded successfully.")
+print("Rows:", len(raw_download))
+
+
+# ============================================================
+# 2. CLEAN THE HISTORICAL DATA
+# ============================================================
+
+raw = clean_yf_download(raw_download, "Close_Price")
+
+if raw is None:
+    print("\nERROR: Could not clean historical data.")
+    sys.exit()
+
+if len(raw) < 50:
+    print("\nERROR: Not enough historical data (need at least 50 rows).")
+    sys.exit()
+
+print("\nCleaned data:")
+print(raw.head())
+print("\nNumber of trading days:", len(raw))
+
+
+# ============================================================
+# 3. ATTACH NEWS SENTIMENT (real if available, synthetic as fallback)
+# ============================================================
+
+print("\nFetching news sentiment...")
+
+sentiment_df = fetch_daily_sentiment(
+    TICKER,
+    ALPHA_VANTAGE_API_KEY,
+    pd.to_datetime(TRAIN_START),
+    pd.to_datetime(TRAIN_END),
+)
+
+if sentiment_df is not None:
+    raw = raw.merge(sentiment_df, on="Date", how="left")
+    covered_days = raw["RealSentiment"].notna().sum()
+    raw["Sentiment"] = raw["RealSentiment"].fillna(0.0)
+    raw.drop(columns=["RealSentiment"], inplace=True)
+    using_real_sentiment = True
+    print(f"Using REAL sentiment for {covered_days}/{len(raw)} trading days "
+          f"(days without coverage treated as neutral).")
+else:
+    print("Falling back to synthetic random sentiment for this run.")
+    np.random.seed(42)
+    raw["Sentiment"] = np.random.uniform(-0.05, 0.05, size=len(raw))
+    using_real_sentiment = False
+    covered_days = 0
+
+
+# ============================================================
+# 4. SCALE THE DATA
+# ============================================================
+
+print("Scaling price and sentiment data...")
+
+scaler_price = MinMaxScaler()
+scaler_sentiment = MinMaxScaler()
+
+raw["Close_Scaled"] = scaler_price.fit_transform(raw[["Close_Price"]]).flatten()
+raw["Sentiment_Scaled"] = scaler_sentiment.fit_transform(raw[["Sentiment"]]).flatten()
+
+
+# ============================================================
+# 5. CREATE LSTM SEQUENCES
+# ============================================================
+
+feature_cols = ["Close_Scaled", "Sentiment_Scaled"]
+features = raw[feature_cols].to_numpy()
+X = np.ascontiguousarray(
+    np.lib.stride_tricks.sliding_window_view(
+        features, SEQUENCE_LENGTH, axis=0
+    )[:-1].transpose(0, 2, 1),
+    dtype=np.float32,
+)
+y = raw["Close_Scaled"].to_numpy(dtype=np.float32)[SEQUENCE_LENGTH:]
+
+print("\nLSTM data shape:")
+print("X:", X.shape)
+print("y:", y.shape)
+
+if len(X) == 0:
+    print("\nERROR: No sequences were created.")
+    sys.exit()
+
+
+# ============================================================
+# 6. BUILD LSTM MODEL (PyTorch)
+# ============================================================
+
+print("\nBuilding LSTM model...")
+
+
+class LSTMPricePredictor(nn.Module):
+    def __init__(self, input_size=2, hidden1=50, hidden2=30, dropout=0.2):
+        super().__init__()
+        self.lstm1 = nn.LSTM(input_size, hidden1, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.lstm2 = nn.LSTM(hidden1, hidden2, batch_first=True)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden2, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm1(x)
+        out = self.dropout1(out)
+        out, _ = self.lstm2(out)
+        out = self.dropout2(out)
+        out = out[:, -1, :]
+        out = self.fc(out)
+        return out
+
+
+model = LSTMPricePredictor().to(DEVICE)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters())
+
+
+# ============================================================
+# 7. TRAIN MODEL
+# ============================================================
+
+print("\n" + "=" * 60)
+print("TRAINING MODEL")
+print("=" * 60)
+
+X_tensor = torch.from_numpy(X)
+y_tensor = torch.from_numpy(y).view(-1, 1)
+
+n_val = max(1, int(len(X_tensor) * VALIDATION_SPLIT))
+n_train = len(X_tensor) - n_val
+
+X_train, X_val = X_tensor[:n_train], X_tensor[n_train:]
+y_train, y_val = y_tensor[:n_train], y_tensor[n_train:]
+
+dataloader_generator = torch.Generator()
+dataloader_generator.manual_seed(SEED)
+
+train_loader = DataLoader(
+    TensorDataset(X_train, y_train),
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    generator=dataloader_generator,
+)
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss = 0.0
+
+    for xb, yb in train_loader:
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+
+        optimizer.zero_grad(set_to_none=True)
+        preds = model(xb)
+        loss = criterion(preds, yb)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * xb.size(0)
+
+    train_loss = running_loss / n_train
+
+    model.eval()
+    with torch.inference_mode():
+        val_preds = model(X_val.to(DEVICE))
+        val_loss = criterion(val_preds, y_val.to(DEVICE)).item()
+
+    print(f"Epoch {epoch + 1}/{EPOCHS} - loss: {train_loss:.6f} - val_loss: {val_loss:.6f}")
+
+print("\nTraining complete!")
+
+
+# ============================================================
+# 8. PREDICT NEXT N TRADING DAYS (with realistic volatility injected)
+# ============================================================
+
+print("\n" + "=" * 60)
+print(f"PREDICTING NEXT {DAYS_TO_PREDICT} TRADING DAYS")
+print("=" * 60)
+
+model.eval()
+
+historical_log_returns = np.diff(np.log(raw["Close_Price"].values))
+last_known_sentiment = float(raw["Sentiment"].iloc[-1])
+
+pred_seq = raw[feature_cols].iloc[-SEQUENCE_LENGTH:].values.astype(np.float32).copy()
+pred_list = []
+
+with torch.inference_mode():
+    for i in range(DAYS_TO_PREDICT):
+        pred_input = pred_seq[-SEQUENCE_LENGTH:].reshape(1, SEQUENCE_LENGTH, 2)
+        pred_input_tensor = torch.from_numpy(pred_input).to(DEVICE)
+
+        pred_scaled = model(pred_input_tensor).cpu().numpy()[0][0]
+        trend_price = scaler_price.inverse_transform(np.array([[pred_scaled]]))[0][0]
+
+        # Jitter for DISPLAY/SCORING only -- scaled down by VOLATILITY_SCALE
+        # so it adds realistic day-to-day texture without swamping the signal.
+        sampled_return = np.random.choice(historical_log_returns) * VOLATILITY_SCALE
+        displayed_price = trend_price * np.exp(sampled_return)
+        pred_list.append(displayed_price)
+
+        # IMPORTANT: feed the model's own clean trend_price back into the
+        # sequence (not the jittered displayed_price). This stops the
+        # noise from compounding day-over-day, which is what was causing
+        # the error to swing wildly (e.g. 4% vs 2%) between runs -- each
+        # day's forecast is now driven by the model's own extrapolation,
+        # with jitter layered on top only for the final output.
+        trend_scaled = scaler_price.transform(np.array([[trend_price]]))[0][0]
+
+        # We can't know FUTURE news, so decay the last known real
+        # sentiment toward neutral (0) instead of inventing fake future
+        # headlines. By day 30 with decay=0.9, this is ~4% of its
+        # original value -- effectively neutral.
+        future_sentiment = last_known_sentiment * (SENTIMENT_DECAY ** (i + 1))
+        new_scaled_sentiment = scaler_sentiment.transform(np.array([[future_sentiment]]))[0][0]
+
+        new_row = np.array([[trend_scaled, new_scaled_sentiment]], dtype=np.float32)
+        pred_seq = np.vstack([pred_seq, new_row])
+
+
+# ============================================================
+# 9. CREATE PREDICTION DATAFRAME
+# ============================================================
+
+last_train_date = raw["Date"].iloc[-1]
+last_train_close = raw["Close_Price"].iloc[-1]
+
+pred_dates = pd.bdate_range(
+    start=last_train_date + pd.Timedelta(days=1),
+    periods=DAYS_TO_PREDICT,
+)
+
+pred_df = pd.DataFrame(
+    {
+        "Date": pd.to_datetime(pred_dates).normalize(),
+        "Predicted_Close": pred_list,
+    }
+)
+
+print("\nPredictions:")
+print(pred_df)
+
+
+# ============================================================
+# 10. DOWNLOAD ACTUAL PRICES FOR THE PREDICTED WINDOW (IF AVAILABLE)
+# ============================================================
+
+print("\n" + "=" * 60)
+print("DOWNLOADING ACTUAL PRICES FOR COMPARISON")
+print("=" * 60)
+
+actual_start = pred_df["Date"].iloc[0]
+actual_end = pred_df["Date"].iloc[-1] + pd.Timedelta(days=10)
+
+comparison = pred_df.copy()
+comparison["Actual_Close"] = np.nan
+
+try:
+    actual_download = yf.download(
+        TICKER,
+        start=actual_start.strftime("%Y-%m-%d"),
+        end=actual_end.strftime("%Y-%m-%d"),
+        auto_adjust=False,
+        progress=False,
+    )
+except Exception as e:
+    actual_download = None
+    print("\nWARNING: Could not download actual prices for comparison.")
+    print("Details:", e)
+
+actual_data = clean_yf_download(actual_download, "Actual_Close") if actual_download is not None else None
+
+if actual_data is None or actual_data.empty:
+    print("\nNo actual price data available yet for this window")
+    print("(this is expected if you're predicting into the future).")
+    print("Skipping the actual-vs-predicted comparison; predictions are shown in the console.")
+else:
+    comparison = pd.merge(
+        pred_df,
+        actual_data[["Date", "Actual_Close"]],
+        on="Date",
+        how="left",
+    )
+
+
+# ============================================================
+# 11. NAIVE "NO-CHANGE" BASELINE
+# ============================================================
+# Classic sanity-check forecast: "tomorrow's price = today's price".
+# Uses the SAME actual future prices as they arrive, so it's scored
+# on equal footing with the LSTM forecast.
+
+naive_prices = []
+prev_actual = last_train_close
+for _, row in comparison.iterrows():
+    naive_prices.append(prev_actual)
+    if pd.notna(row["Actual_Close"]):
+        prev_actual = row["Actual_Close"]
+comparison["Naive_Close"] = naive_prices
+
+
+# ============================================================
+# 12. CALCULATE PERCENTAGE ERROR FOR BOTH MODELS (WHERE POSSIBLE)
+# ============================================================
+
+comparison["%Error"] = np.nan
+comparison["Naive_%Error"] = np.nan
+
+valid_prices = comparison["Actual_Close"].notna() & (comparison["Actual_Close"] != 0)
+
+comparison.loc[valid_prices, "%Error"] = (
+    abs(comparison.loc[valid_prices, "Predicted_Close"] - comparison.loc[valid_prices, "Actual_Close"])
+    / comparison.loc[valid_prices, "Actual_Close"]
+    * 100
+)
+
+comparison.loc[valid_prices, "Naive_%Error"] = (
+    abs(comparison.loc[valid_prices, "Naive_Close"] - comparison.loc[valid_prices, "Actual_Close"])
+    / comparison.loc[valid_prices, "Actual_Close"]
+    * 100
+)
+
+print("\n" + "=" * 60)
+print("ACTUAL VS PREDICTED VS NAIVE BASELINE")
+print("=" * 60)
+print(comparison[["Date", "Actual_Close", "Predicted_Close", "Naive_Close", "%Error", "Naive_%Error"]].round(3))
+
+lstm_avg_error = comparison["%Error"].mean()
+naive_avg_error = comparison["Naive_%Error"].mean()
+
+print()
+if pd.isna(lstm_avg_error) or pd.isna(naive_avg_error):
+    print("Average % Error: Could not be calculated (no actual data to compare against yet).")
+else:
+    print(f"LSTM  average % error : {lstm_avg_error:.2f}%")
+    print(f"Naive average % error : {naive_avg_error:.2f}%")
+    if lstm_avg_error < naive_avg_error:
+        print(f"-> The LSTM beat the naive no-change baseline by {naive_avg_error - lstm_avg_error:.2f} points.")
+    elif lstm_avg_error > naive_avg_error:
+        print(f"-> The naive no-change baseline actually beat the LSTM by {lstm_avg_error - naive_avg_error:.2f} points.")
+    else:
+        print("-> The LSTM and the naive baseline performed about the same.")
